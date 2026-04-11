@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+pydantic
+pandas
+numpy
+transformers
+torch
+yfinance
+scikit-learn
+tensorflow-cpu
