@@ -8,3 +8,6 @@ torch
 yfinance
 scikit-learn
 tensorflow-cpu
+#pip install fastapi uvicorn numpy pandas yfinance --no-cache-dir
+#pip install scikit-learn --no-cache-dir
+#pip install tensorflow-cpu --no-cache-dir

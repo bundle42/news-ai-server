@@ -54,6 +54,13 @@ async def predict(request: Dict[str, Any]):
     # -----------------------------
     stock_df = yfinance_loader.download_stock_data(stock_name).copy()
 
+    if stock_df is None or stock_df.empty:
+        print("❌ 데이터 다운로드 실패")
+        return {
+            "prediction": None,
+            "error": "데이터 없음"
+        }
+    
     # stock_df 예시 컬럼:
     # ["date", "open", "high", "low", "close", "volume", ...]
 
@@ -209,6 +216,8 @@ async def predict(request: Dict[str, Any]):
         how="left"
     )
 
+    merged_df = merged_df.dropna(subset=["close"]).reset_index(drop=True) # yf에서 종가 갱신 늦는 경우 제거
+
     # 뉴스가 없는 거래일은 0으로 채움
     news_feature_cols = [
         "news_count", "sentiment_sum", "sentiment_mean", "sentiment_std",
@@ -252,7 +261,13 @@ async def predict(request: Dict[str, Any]):
     # -----------------------------
     # 11) LSTM 예측
     # -----------------------------
-    lstm_result = lstm_v1.predict(train_df, inference_df)
+    lstm_result = lstm_v1.predict(
+        stock_name=stock_name,
+        train_df=train_df,
+        inference_df=inference_df,
+        model_base_dir=".",
+        auto_train_if_missing=True,
+    )
 
     # -----------------------------
     # 11-1) 방향 계산 및 적중 여부 추가
@@ -313,3 +328,122 @@ async def predict(request: Dict[str, Any]):
         "train_data": train_df_return.to_dict(orient="records"),
         "lstm_result": lstm_result
     }
+
+
+@app.post("/train", response_model=None)
+async def train(request: Dict[str, Any]):
+    """
+    저장용 학습 엔드포인트.
+    - 프론트/백엔드는 기본적으로 /predict만 호출해도 되지만,
+      운영에서는 /train을 배치로 돌리고 /predict는 로드+추론만 하는 형태를 권장.
+    """
+    stock_name = request.get("stockName")
+    features = request.get("features", [])
+
+    if not stock_name:
+        return {"error": "stockName이 없습니다."}
+    if not features:
+        return {"error": "features가 없습니다."}
+
+    stock_df = yfinance_loader.download_stock_data(stock_name).copy()
+    if stock_df is None or stock_df.empty:
+        return {"error": "데이터 없음"}
+
+    feature_df = pd.DataFrame(features).copy()
+    if feature_df.empty:
+        return {"error": "뉴스 feature 데이터가 비어 있습니다."}
+
+    stock_df["date"] = pd.to_datetime(stock_df["date"], format="%Y-%m-%d", errors="coerce")
+    feature_df["date"] = pd.to_datetime(feature_df["date"], format="%y-%m-%d", errors="coerce")
+    stock_df = stock_df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
+    feature_df = feature_df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
+
+    numeric_cols = [
+        "news_count",
+        "sentiment_mean",
+        "sentiment_std",
+        "sentiment_sum",
+        "positive_count",
+        "negative_count",
+        "neutral_count",
+        "positive_ratio",
+        "negative_ratio",
+        "neutral_ratio",
+        "confidence_mean"
+    ]
+    for col in numeric_cols:
+        if col in feature_df.columns:
+            feature_df[col] = pd.to_numeric(feature_df[col], errors="coerce")
+    feature_df = feature_df.fillna(0)
+
+    stock_dates = sorted(stock_df["date"].unique())
+    if len(stock_dates) < 2:
+        return {"error": "주가 데이터가 너무 적어 학습이 어렵습니다."}
+
+    prev_map = {}
+    for i in range(1, len(stock_dates)):
+        prev_map[stock_dates[i]] = stock_dates[i - 1]
+
+    def map_news_to_input_date(news_date):
+        future_trading_days = [d for d in stock_dates if d >= news_date]
+        if len(future_trading_days) == 0:
+            return None
+        next_trading_day = future_trading_days[0]
+        if news_date == next_trading_day:
+            return news_date
+        return prev_map.get(next_trading_day, None)
+
+    feature_df["input_date"] = feature_df["date"].apply(map_news_to_input_date)
+    feature_df = feature_df.dropna(subset=["input_date"]).reset_index(drop=True)
+
+    def aggregate_news(group):
+        total_news = group["news_count"].sum()
+        if total_news == 0:
+            total_news = 1
+        pos_count = group["positive_count"].sum() if "positive_count" in group else 0
+        neg_count = group["negative_count"].sum() if "negative_count" in group else 0
+        neu_count = group["neutral_count"].sum() if "neutral_count" in group else 0
+
+        result = {
+            "news_count": group["news_count"].sum(),
+            "sentiment_sum": group["sentiment_sum"].sum(),
+            "sentiment_mean": (group["sentiment_mean"] * group["news_count"]).sum() / total_news,
+            "sentiment_std": (group["sentiment_std"] * group["news_count"]).sum() / total_news,
+            "positive_count": pos_count,
+            "negative_count": neg_count,
+            "neutral_count": neu_count,
+            "confidence_mean": (group["confidence_mean"] * group["news_count"]).sum() / total_news,
+        }
+
+        result["positive_ratio"] = pos_count / total_news
+        result["negative_ratio"] = neg_count / total_news
+        result["neutral_ratio"] = neu_count / total_news
+        return pd.Series(result)
+
+    feature_grouped = (
+        feature_df
+        .groupby("input_date")
+        .apply(aggregate_news)
+        .reset_index()
+        .rename(columns={"input_date": "date"})
+    )
+
+    merged_df = pd.merge(stock_df, feature_grouped, on="date", how="left")
+    merged_df = merged_df.dropna(subset=["close"]).reset_index(drop=True)
+
+    news_feature_cols = [
+        "news_count", "sentiment_sum", "sentiment_mean", "sentiment_std",
+        "positive_count", "negative_count", "neutral_count",
+        "positive_ratio", "negative_ratio", "neutral_ratio",
+        "confidence_mean"
+    ]
+    for col in news_feature_cols:
+        if col not in merged_df.columns:
+            merged_df[col] = 0
+        merged_df[col] = merged_df[col].fillna(0)
+
+    train_df = merged_df.copy()
+    train_df["target_close"] = train_df["close"].shift(-1)
+    train_df = train_df.dropna(subset=["target_close"]).reset_index(drop=True)
+
+    return lstm_v1.train_and_save(stock_name=stock_name, train_df=train_df, model_base_dir=".")
