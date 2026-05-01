@@ -17,16 +17,24 @@ jobs:
           username: ec2-user
           key: ${{ secrets.EC2_KEY }}
           script: |
-            cd ~/news-ai-server
+            cd /home/ec2-user/news-ai-server
 
-            # 최신 코드 가져오기
+            echo "===== GIT PULL ====="
             git pull origin main
 
-            # 가상환경 활성화
+            echo "===== ACTIVATE VENV ====="
             source venv/bin/activate
 
-            # 기존 서버 종료
-            pkill -f "uvicorn" || true
+            echo "===== STOP SERVER ====="
+            lsof -ti:8000 | xargs kill -9 || true
 
-            # 서버 실행
+            echo "===== START SERVER ====="
             nohup uvicorn main:app --host 0.0.0.0 --port 8000 > uvicorn.log 2>&1 &
+
+            sleep 3
+
+            echo "===== CHECK PROCESS ====="
+            ps -ef | grep uvicorn
+
+            echo "===== LAST LOG ====="
+            tail -n 20 uvicorn.log
