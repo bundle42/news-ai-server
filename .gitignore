@@ -35,6 +35,3 @@ dist/
 
 # DB (로컬 테스트용)
 *.sqlite3
-
-# Models
-models/
