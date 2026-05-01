@@ -65,29 +65,19 @@ def predict(train_df: pd.DataFrame, inference_df: pd.DataFrame):
     train_df[target_col] = train_df[target_col].ffill()
 
     # ----------------------------------
-    # 4) 스케일링
-    # ----------------------------------
-    feature_scaler = MinMaxScaler()
-    target_scaler = MinMaxScaler()
-
-    X_train_scaled = feature_scaler.fit_transform(train_df[feature_cols])
-    y_train_scaled = target_scaler.fit_transform(train_df[[target_col]])
-
-    # ----------------------------------
-    # 5) 시퀀스 데이터 생성 함수
+    # 4) 시퀀스 데이터 생성 함수
     # ----------------------------------
     def create_sequences(X, y=None, seq_len=5):
         X_seq, y_seq = [], []
 
         if y is not None:
             for i in range(seq_len, len(X)):
-                X_seq.append(X[i-seq_len:i])
+                X_seq.append(X[i - seq_len:i])
                 y_seq.append(y[i])
             return np.array(X_seq), np.array(y_seq)
-
         else:
             for i in range(seq_len, len(X) + 1):
-                X_seq.append(X[i-seq_len:i])
+                X_seq.append(X[i - seq_len:i])
             return np.array(X_seq)
 
     SEQ_LEN = 5
@@ -97,18 +87,48 @@ def predict(train_df: pd.DataFrame, inference_df: pd.DataFrame):
             "error": f"학습 데이터가 너무 적습니다. 최소 {SEQ_LEN + 1}개 이상 필요합니다."
         }
 
-    X_seq, y_seq = create_sequences(X_train_scaled, y_train_scaled, seq_len=SEQ_LEN)
+    # ----------------------------------
+    # 5) 학습/검증 분리 (스케일링 전에 분리 → 리케이지 방지)
+    # ----------------------------------
+    split_idx = int(len(train_df) * 0.8)
+
+    # 검증셋이 너무 작으면 고정 20개로 잡기
+    if len(train_df) - split_idx < 20:
+        split_idx = max(SEQ_LEN + 1, len(train_df) - 20)
+
+    train_part = train_df.iloc[:split_idx].reset_index(drop=True)
+    val_part = train_df.iloc[split_idx:].reset_index(drop=True)
 
     # ----------------------------------
-    # 6) 학습/검증 분리
+    # 6) 스케일링 (학습셋에만 fit)
     # ----------------------------------
-    split_idx = int(len(X_seq) * 0.8)
+    feature_scaler = MinMaxScaler()
+    target_scaler = MinMaxScaler()
 
-    X_train, X_val = X_seq[:split_idx], X_seq[split_idx:]
-    y_train, y_val = y_seq[:split_idx], y_seq[split_idx:]
+    X_train_scaled = feature_scaler.fit_transform(train_part[feature_cols])
+    y_train_scaled = target_scaler.fit_transform(train_part[[target_col]])
+
+    X_val_scaled = feature_scaler.transform(val_part[feature_cols])
+    y_val_scaled = target_scaler.transform(val_part[[target_col]])
 
     # ----------------------------------
-    # 7) LSTM 모델 생성
+    # 7) 시퀀스 생성
+    # ----------------------------------
+    X_train, y_train = create_sequences(X_train_scaled, y_train_scaled, SEQ_LEN)
+    X_val, y_val = create_sequences(X_val_scaled, y_val_scaled, SEQ_LEN)
+
+    if len(X_train) == 0:
+        return {
+            "error": f"시퀀스 생성 후 학습 데이터가 없습니다. 데이터를 더 늘려주세요."
+        }
+
+    if len(X_val) == 0:
+        return {
+            "error": f"시퀀스 생성 후 검증 데이터가 없습니다. 데이터를 더 늘려주세요."
+        }
+
+    # ----------------------------------
+    # 8) LSTM 모델 생성
     # ----------------------------------
     model = Sequential([
         LSTM(64, return_sequences=True, input_shape=(SEQ_LEN, len(feature_cols))),
@@ -134,9 +154,9 @@ def predict(train_df: pd.DataFrame, inference_df: pd.DataFrame):
     )
 
     # ----------------------------------
-    # 8) 모델 학습
+    # 9) 모델 학습
     # ----------------------------------
-    history = model.fit(
+    model.fit(
         X_train, y_train,
         validation_data=(X_val, y_val),
         epochs=100,
@@ -146,7 +166,7 @@ def predict(train_df: pd.DataFrame, inference_df: pd.DataFrame):
     )
 
     # ----------------------------------
-    # 9) 검증 성능 평가
+    # 10) 검증 성능 평가
     # ----------------------------------
     val_pred_scaled = model.predict(X_val, verbose=0)
     val_pred = target_scaler.inverse_transform(val_pred_scaled)
@@ -156,56 +176,72 @@ def predict(train_df: pd.DataFrame, inference_df: pd.DataFrame):
     mae = float(mean_absolute_error(y_val_real, val_pred))
 
     # ----------------------------------
-    # 10) 학습 데이터 전체에 대한 예측값 생성
+    # 11) 학습 데이터 전체에 대한 예측값 생성 (historical)
+    #     리케이지 없이 전체 데이터를 다시 스케일링해서 시퀀스 생성
     # ----------------------------------
-    train_pred_scaled = model.predict(X_seq, verbose=0)
+    X_all_scaled = feature_scaler.transform(train_df[feature_cols])
+    y_all_scaled = target_scaler.transform(train_df[[target_col]])
+    X_all_seq, _ = create_sequences(X_all_scaled, y_all_scaled, SEQ_LEN)
+
+    train_pred_scaled = model.predict(X_all_seq, verbose=0)
     train_pred = target_scaler.inverse_transform(train_pred_scaled).flatten()
 
-    # 날짜 맞추기 (SEQ_LEN 이후부터 예측 가능)
-    pred_dates = train_df["date"].shift(-1).iloc[SEQ_LEN:].reset_index(drop=True)
+    # 거래일 리스트 (train_df 기준)
+    train_dates = train_df["date"].reset_index(drop=True)
+
+    infer_dates = inference_df["date"].sort_values().reset_index(drop=True)
 
     historical_predictions = []
     for i in range(len(train_pred)):
-        # 마지막 날짜 처리
-        if i == len(train_pred) - 1:
-            pred_date = inference_df["date"].iloc[-1]  # inference_df 마지막 날짜 사용
+        current_date = train_dates.iloc[SEQ_LEN + i]
+
+        # 다음 거래일 찾기 (train_df 내 실제 거래일 기준)
+        future_dates = [d for d in train_dates if d > current_date]
+
+        if future_dates:
+            pred_date = future_dates[0]
         else:
-            pred_date = pred_dates.iloc[i]
+            # 마지막 행 → inference_df에서 다음 거래일 찾기
+            future_infer = [d for d in infer_dates if d > current_date]
+            pred_date = future_infer[0] if future_infer else current_date
+
+        actual_idx = SEQ_LEN + i
+        if actual_idx >= len(train_df):
+            break
 
         historical_predictions.append({
-            "date": str(pred_date.date()),
-            "actual_target_close": float(train_df["target_close"].iloc[SEQ_LEN + i]),
+            "date": str(current_date.date()) if hasattr(current_date, "date") else str(current_date),
+            "actual_target_close": float(train_df["target_close"].iloc[actual_idx]),
             "predicted_target_close": float(train_pred[i])
         })
 
     print(historical_predictions[-5:])
 
     # ----------------------------------
-    # 11) 최신 데이터로 "다음 거래일 종가" 예측
+    # 12) 최신 데이터로 "다음 거래일 종가" 예측
     # ----------------------------------
     inference_df = inference_df.sort_values("date").reset_index(drop=True)
     inference_df[feature_cols] = inference_df[feature_cols].fillna(0)
-    X_infer_scaled = feature_scaler.transform(inference_df[feature_cols])
 
     if len(inference_df) < SEQ_LEN:
         return {
             "error": f"추론 데이터가 너무 적습니다. 최소 {SEQ_LEN}개 이상 필요합니다."
         }
 
+    X_infer_scaled = feature_scaler.transform(inference_df[feature_cols])
     latest_seq = X_infer_scaled[-SEQ_LEN:]
     latest_seq = np.expand_dims(latest_seq, axis=0)
 
-    next_close_scaled = model.predict(latest_seq, verbose=0) # 예측 실행
-    next_close_pred = float(target_scaler.inverse_transform(next_close_scaled)[0][0]) # 예측 결과
+    next_close_scaled = model.predict(latest_seq, verbose=0)
+    next_close_pred = float(target_scaler.inverse_transform(next_close_scaled)[0][0])
 
     latest_close = float(inference_df["close"].iloc[-1])
     predicted_change = next_close_pred - latest_close
     predicted_change_pct = (predicted_change / latest_close) * 100 if latest_close != 0 else 0.0
-
     direction = "UP" if next_close_pred > latest_close else "DOWN"
 
     # ----------------------------------
-    # 12) 결과 반환
+    # 13) 결과 반환
     # ----------------------------------
     return {
         "feature_cols": feature_cols,

@@ -1,4 +1,3 @@
-
 from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import List, Dict, Any
@@ -9,27 +8,29 @@ import pandas as pd
 
 app = FastAPI()
 
+
 @app.get("/")
 def read_root():
     return {"message": "한국어 뉴스 감성 분석 API입니다. /analyze 엔드포인트로 POST 요청을 보내주세요."}
 
+
 class NewsRequest(BaseModel):
     content: str
+
 
 @app.post("/read")
 def read_news(request: NewsRequest):
     return {"message": f"뉴스 내용이 수신되었습니다: {request.content[:100]}... (총 {len(request.content)}자)"}
 
+
 @app.post("/analyze-batch")
 def analyze_titles(request: dict):
-    contents = request["contents"]  # 리스트 받기
+    contents = request["contents"]
 
     results = []
-
     for text in contents:
         text = text[:512]
         result = pipeline_loader2.load_analyze(text)
-
         results.append({
             "label": result["label"],
             "confidence": result["confidence"],
@@ -37,6 +38,7 @@ def analyze_titles(request: dict):
         })
 
     return results
+
 
 @app.post("/predict", response_model=None)
 async def predict(request: Dict[str, Any]):
@@ -54,9 +56,6 @@ async def predict(request: Dict[str, Any]):
     # -----------------------------
     stock_df = yfinance_loader.download_stock_data(stock_name).copy()
 
-    # stock_df 예시 컬럼:
-    # ["date", "open", "high", "low", "close", "volume", ...]
-
     # -----------------------------
     # 2) feature 리스트 -> DataFrame
     # -----------------------------
@@ -71,9 +70,11 @@ async def predict(request: Dict[str, Any]):
 
     # -----------------------------
     # 3) 날짜 형식 통일
+    #    stock_df: "%Y-%m-%d"
+    #    feature_df: 실제 포맷에 맞게 수정 필요 (기존 "%y-%m-%d"는 2자리 연도라 주의)
     # -----------------------------
-    stock_df["date"] = pd.to_datetime(stock_df["date"], format="%Y-%m-%d", errors="coerce")
-    feature_df["date"] = pd.to_datetime(feature_df["date"], format="%y-%m-%d", errors="coerce")
+    stock_df["date"] = pd.to_datetime(stock_df["date"], errors="coerce")
+    feature_df["date"] = pd.to_datetime(feature_df["date"], errors="coerce")
 
     stock_df = stock_df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
     feature_df = feature_df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
@@ -121,31 +122,17 @@ async def predict(request: Dict[str, Any]):
     # -----------------------------
     # 6) 뉴스 날짜를 "입력 row 날짜(input_date)"로 매핑
     # -----------------------------
-    # 규칙:
-    # - 뉴스가 거래일 당일이면 그 날짜 row에 붙임
-    # - 뉴스가 휴장일(주말/공휴일)이면 다음 거래일의 직전 거래일 row에 붙임
-    #
-    # 예:
-    # - 금요일 뉴스 -> 금요일 row
-    # - 토요일 뉴스 -> 금요일 row
-    # - 일요일 뉴스 -> 금요일 row
-    # - 수요일 공휴일 뉴스 -> 화요일 row (목요일 예측용)
-    # -----------------------------
     def map_news_to_input_date(news_date):
-        # news_date 이후 첫 거래일 찾기
         future_trading_days = [d for d in stock_dates if d >= news_date]
 
         if len(future_trading_days) == 0:
-            # 주가 데이터 범위 밖의 미래 뉴스는 처리 불가
             return None
 
         next_trading_day = future_trading_days[0]
 
-        # 뉴스 날짜가 실제 거래일이면 그 날짜 row에 붙임
         if news_date == next_trading_day:
             return news_date
 
-        # 뉴스 날짜가 휴장일이면 다음 거래일의 직전 거래일 row에 붙임
         return prev_map.get(next_trading_day, None)
 
     feature_df["input_date"] = feature_df["date"].apply(map_news_to_input_date)
@@ -155,16 +142,12 @@ async def predict(request: Dict[str, Any]):
     print(feature_df[["date", "input_date", "news_count", "sentiment_mean", "sentiment_sum"]].head(30))
 
     # -----------------------------
-    # 7) 같은 input_date로 몰린 뉴스 집계
-    # -----------------------------
-    # 주의:
-    # 단순 평균이 아니라 "기사 수(news_count)" 가중 평균을 사용
+    # 7) 같은 input_date로 몰린 뉴스 집계 (기사 수 가중 평균)
     # -----------------------------
     def aggregate_news(group):
         total_news = group["news_count"].sum()
-
         if total_news == 0:
-            total_news = 1  # 0 division 방지
+            total_news = 1
 
         pos_count = group["positive_count"].sum() if "positive_count" in group else 0
         neg_count = group["negative_count"].sum() if "negative_count" in group else 0
@@ -179,12 +162,10 @@ async def predict(request: Dict[str, Any]):
             "negative_count": neg_count,
             "neutral_count": neu_count,
             "confidence_mean": (group["confidence_mean"] * group["news_count"]).sum() / total_news,
+            "positive_ratio": pos_count / total_news,
+            "negative_ratio": neg_count / total_news,
+            "neutral_ratio": neu_count / total_news,
         }
-
-        # 비율은 합산 후 재계산
-        result["positive_ratio"] = pos_count / total_news
-        result["negative_ratio"] = neg_count / total_news
-        result["neutral_ratio"] = neu_count / total_news
 
         return pd.Series(result)
 
@@ -209,7 +190,6 @@ async def predict(request: Dict[str, Any]):
         how="left"
     )
 
-    # 뉴스가 없는 거래일은 0으로 채움
     news_feature_cols = [
         "news_count", "sentiment_sum", "sentiment_mean", "sentiment_std",
         "positive_count", "negative_count", "neutral_count",
@@ -227,17 +207,10 @@ async def predict(request: Dict[str, Any]):
 
     # -----------------------------
     # 9) 학습용 데이터 생성
-    # -----------------------------
-    # 오늘 row의 feature로 다음 거래일 종가 예측
-    # 즉:
-    #   월 row -> 화 close
-    #   화 row -> 수 close
-    #   금 row -> 월 close
+    #    오늘 row의 feature로 다음 거래일 종가 예측
     # -----------------------------
     train_df = merged_df.copy()
     train_df["target_close"] = train_df["close"].shift(-1)
-
-    # 마지막 거래일은 target이 없으므로 제거
     train_df = train_df.dropna(subset=["target_close"]).reset_index(drop=True)
 
     print("=== train_df ===")
@@ -246,7 +219,6 @@ async def predict(request: Dict[str, Any]):
     # -----------------------------
     # 10) 추론용 데이터 생성
     # -----------------------------
-    # 최신 날짜 row까지 유지
     inference_df = merged_df.copy()
 
     # -----------------------------
@@ -255,28 +227,28 @@ async def predict(request: Dict[str, Any]):
     lstm_result = lstm_v1.predict(train_df, inference_df)
 
     # -----------------------------
-    # 11-1) 방향 계산 및 적중 여부 추가
+    # 12) 방향 계산 및 적중 여부 추가
     # -----------------------------
     historical_predictions = lstm_result.get("historical_predictions", [])
 
-    for item in historical_predictions:
-        # 날짜 통일
-        date = pd.to_datetime(item["date"])
-        merged_df["date"] = pd.to_datetime(merged_df["date"])
+    merged_df["date"] = pd.to_datetime(merged_df["date"])
 
-        # 이전 종가 찾기
+    for item in historical_predictions:
+        date = pd.to_datetime(item["date"])
+
         previous_rows = merged_df[merged_df["date"] < date]
+
+        # 수정: 이전 거래일이 없으면 자기 자신(첫 행) 종가 사용
         if previous_rows.empty:
-            # 이전 거래일이 없으면 merged_df 마지막 종가 사용
-            previous_close = merged_df["close"].iloc[-1]
+            previous_close = float(merged_df["close"].iloc[0])
         else:
-            previous_close = previous_rows.iloc[-1]["close"]
+            previous_close = float(previous_rows.iloc[-1]["close"])
+
         item["previous_close"] = previous_close
 
-        # 실제 종가
         actual_close = item["actual_target_close"]
+        predicted_close = item["predicted_target_close"]
 
-        # 실제 방향
         if actual_close > previous_close:
             item["actual_direction"] = "UP"
         elif actual_close < previous_close:
@@ -284,8 +256,6 @@ async def predict(request: Dict[str, Any]):
         else:
             item["actual_direction"] = "SAME"
 
-        # 예측 종가
-        predicted_close = item["predicted_target_close"]
         if predicted_close > previous_close:
             item["predicted_direction"] = "UP"
         elif predicted_close < previous_close:
@@ -293,13 +263,12 @@ async def predict(request: Dict[str, Any]):
         else:
             item["predicted_direction"] = "SAME"
 
-        # 방향 적중 여부
         item["direction_match"] = (item["actual_direction"] == item["predicted_direction"])
 
     lstm_result["historical_predictions"] = historical_predictions
 
     # -----------------------------
-    # 12) 반환용 날짜 문자열 변환
+    # 13) 반환용 날짜 문자열 변환
     # -----------------------------
     merged_df_return = merged_df.copy()
     merged_df_return["date"] = merged_df_return["date"].dt.strftime("%Y-%m-%d")
