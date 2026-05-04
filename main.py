@@ -55,6 +55,7 @@ async def predict(request: Dict[str, Any]):
     # 1) 주가 데이터 불러오기
     # -----------------------------
     stock_df = yfinance_loader.download_stock_data(stock_name).copy()
+    stock_df = stock_df.dropna(subset=["close", "adj_close"])
 
     # -----------------------------
     # 2) feature 리스트 -> DataFrame
